@@ -2,7 +2,7 @@
 
 A self-hosted book collection manager. Add books by ISBN or title, auto-filled from Open Library. Covers, search, CSV export.
 
-Built with Flask + PostgreSQL. Published automatically to GitHub Container Registry on every push to `main`.
+Built with Flask + PostgreSQL.
 
 ---
 
