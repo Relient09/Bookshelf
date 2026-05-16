@@ -17,8 +17,29 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
 
+# --- Models ---
 
-# --- Model ---
+# Many-to-many join table: books <-> shelves
+book_shelves = db.Table('book_shelves',
+    db.Column('book_id',  db.Integer, db.ForeignKey('books.id'),  primary_key=True),
+    db.Column('shelf_id', db.Integer, db.ForeignKey('shelves.id'), primary_key=True),
+)
+
+
+class Shelf(db.Model):
+    __tablename__ = 'shelves'
+    id         = db.Column(db.Integer, primary_key=True)
+    name       = db.Column(db.String(128), nullable=False, unique=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id':         self.id,
+            'name':       self.name,
+            'book_count': len(self.books),
+        }
+
+
 class Book(db.Model):
     __tablename__ = 'books'
     id           = db.Column(db.Integer, primary_key=True)
@@ -30,6 +51,7 @@ class Book(db.Model):
     publish_date = db.Column(db.String(64))
     cover_url    = db.Column(db.String(1024))
     added_at     = db.Column(db.DateTime, default=datetime.utcnow)
+    shelves      = db.relationship('Shelf', secondary=book_shelves, backref='books', lazy=True)
 
     def to_dict(self):
         return {
@@ -42,6 +64,8 @@ class Book(db.Model):
             'publish_date': self.publish_date,
             'cover_url':    self.cover_url,
             'added_at':     self.added_at.isoformat() if self.added_at else None,
+            'shelf_ids':    [s.id for s in self.shelves],
+            'shelf_names':  [s.name for s in self.shelves],
         }
 
 
@@ -54,7 +78,6 @@ def create_tables():
 # --- Open Library Helpers ---
 
 def fetch_description(work_key):
-    """Fetch description text from the Works endpoint e.g. /works/OL123W"""
     try:
         resp = requests.get(f'https://openlibrary.org{work_key}.json', timeout=10)
         data = resp.json()
@@ -80,11 +103,10 @@ def fetch_by_isbn(isbn):
     if 'cover' in book:
         cover = book['cover'].get('large') or book['cover'].get('medium') or book['cover'].get('small')
 
-    authors = ', '.join(a['name'] for a in book.get('authors', []))
-    publishers = ', '.join(p['name'] for p in book.get('publishers', []))
+    authors     = ', '.join(a['name'] for a in book.get('authors', []))
+    publishers  = ', '.join(p['name'] for p in book.get('publishers', []))
     publish_date = book.get('publish_date', '')
 
-    # Try excerpts first, then fall back to the Works description
     description = ''
     if book.get('excerpts'):
         description = book['excerpts'][0].get('text', '')
@@ -94,38 +116,25 @@ def fetch_by_isbn(isbn):
             description = fetch_description(work_key)
 
     return {
-        'isbn':         isbn,
-        'title':        book.get('title', ''),
-        'author':       authors,
-        'description':  description,
-        'publisher':    publishers,
-        'publish_date': publish_date,
-        'cover_url':    cover,
+        'isbn': isbn, 'title': book.get('title', ''), 'author': authors,
+        'description': description, 'publisher': publishers,
+        'publish_date': publish_date, 'cover_url': cover,
     }
 
 
 def fetch_edition_details(ol_edition_key, partial):
-    """
-    Fetch full edition data from /books/OL123M.json and enrich the partial
-    result with ISBN, publisher, publish date, and description.
-    """
     try:
-        resp = requests.get(f'https://openlibrary.org{ol_edition_key}.json', timeout=10)
+        resp    = requests.get(f'https://openlibrary.org{ol_edition_key}.json', timeout=10)
         edition = resp.json()
 
-        # ISBN - prefer ISBN-13
         isbn = partial.get('isbn') or ''
         if not isbn:
             isbns = edition.get('isbn_13') or edition.get('isbn_10') or []
-            isbn = isbns[0] if isbns else ''
+            isbn  = isbns[0] if isbns else ''
 
-        # Publisher
-        publisher = partial.get('publisher') or ', '.join(edition.get('publishers', []))
-
-        # Publish date
+        publisher    = partial.get('publisher') or ', '.join(edition.get('publishers', []))
         publish_date = partial.get('publish_date') or edition.get('publish_date', '')
 
-        # Description - try edition body first, then fall back to Works
         ed_desc = edition.get('description', '')
         if isinstance(ed_desc, dict):
             ed_desc = ed_desc.get('value', '')
@@ -136,12 +145,8 @@ def fetch_edition_details(ol_edition_key, partial):
             if work_key:
                 description = fetch_description(work_key)
 
-        partial.update({
-            'isbn':         isbn,
-            'publisher':    publisher,
-            'publish_date': publish_date,
-            'description':  description,
-        })
+        partial.update({'isbn': isbn, 'publisher': publisher,
+                        'publish_date': publish_date, 'description': description})
     except Exception:
         pass
     return partial
@@ -154,35 +159,83 @@ def fetch_by_title(title):
         f'&limit=5'
         f'&fields=key,title,author_name,isbn,publisher,first_publish_year,cover_i,edition_key'
     )
-    resp = requests.get(url, timeout=10)
-    data = resp.json()
+    resp    = requests.get(url, timeout=10)
+    data    = resp.json()
     results = []
     for doc in data.get('docs', []):
-        cover_id = doc.get('cover_i')
-        cover_url = f'https://covers.openlibrary.org/b/id/{cover_id}-L.jpg' if cover_id else None
-        isbn = (doc.get('isbn') or [None])[0]
-        edition_keys = doc.get('edition_key') or []
-        ol_edition = f'/books/{edition_keys[0]}' if edition_keys else None
+        cover_id   = doc.get('cover_i')
+        cover_url  = f'https://covers.openlibrary.org/b/id/{cover_id}-L.jpg' if cover_id else None
+        isbn       = (doc.get('isbn') or [None])[0]
+        ed_keys    = doc.get('edition_key') or []
+        ol_edition = f'/books/{ed_keys[0]}' if ed_keys else None
 
         partial = {
-            'isbn':         isbn,
-            'title':        doc.get('title', ''),
-            'author':       ', '.join(doc.get('author_name', [])),
-            'description':  '',
-            'publisher':    ', '.join((doc.get('publisher') or [])[:2]),
+            'isbn': isbn, 'title': doc.get('title', ''),
+            'author': ', '.join(doc.get('author_name', [])),
+            'description': '',
+            'publisher': ', '.join((doc.get('publisher') or [])[:2]),
             'publish_date': str(doc.get('first_publish_year', '')),
-            'cover_url':    cover_url,
+            'cover_url': cover_url,
         }
-
-        # Second call to fill in missing fields from the full edition record
         if ol_edition:
             partial = fetch_edition_details(ol_edition, partial)
-
         results.append(partial)
     return results
 
 
-# --- Routes ---
+# --- Shelf Routes ---
+
+@app.route('/api/shelves', methods=['GET'])
+def list_shelves():
+    shelves = Shelf.query.order_by(Shelf.name).all()
+    return jsonify([s.to_dict() for s in shelves])
+
+
+@app.route('/api/shelves', methods=['POST'])
+def create_shelf():
+    data = request.json
+    name = (data.get('name') or '').strip()
+    if not name:
+        return jsonify({'error': 'Name is required'}), 400
+    if Shelf.query.filter_by(name=name).first():
+        return jsonify({'error': 'A shelf with that name already exists'}), 409
+    shelf = Shelf(name=name)
+    db.session.add(shelf)
+    db.session.commit()
+    return jsonify(shelf.to_dict()), 201
+
+
+@app.route('/api/shelves/<int:shelf_id>', methods=['DELETE'])
+def delete_shelf(shelf_id):
+    shelf = Shelf.query.get_or_404(shelf_id)
+    db.session.delete(shelf)
+    db.session.commit()
+    return jsonify({'deleted': True})
+
+
+@app.route('/api/books/<int:book_id>/shelves', methods=['POST'])
+def add_book_to_shelf(book_id):
+    book     = Book.query.get_or_404(book_id)
+    shelf_id = (request.json or {}).get('shelf_id')
+    shelf    = Shelf.query.get_or_404(shelf_id)
+    if shelf not in book.shelves:
+        book.shelves.append(shelf)
+        db.session.commit()
+    return jsonify(book.to_dict())
+
+
+@app.route('/api/books/<int:book_id>/shelves/<int:shelf_id>', methods=['DELETE'])
+def remove_book_from_shelf(book_id, shelf_id):
+    book  = Book.query.get_or_404(book_id)
+    shelf = Shelf.query.get_or_404(shelf_id)
+    if shelf in book.shelves:
+        book.shelves.remove(shelf)
+        db.session.commit()
+    return jsonify(book.to_dict())
+
+
+# --- Book Routes ---
+
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -212,10 +265,14 @@ def lookup_title():
 
 @app.route('/api/books', methods=['GET'])
 def list_books():
-    q = request.args.get('q', '').strip()
-    query = Book.query
+    q        = request.args.get('q', '').strip()
+    shelf_id = request.args.get('shelf_id', '').strip()
+    query    = Book.query
+
+    if shelf_id:
+        query = query.filter(Book.shelves.any(Shelf.id == int(shelf_id)))
     if q:
-        like = f'%{q}%'
+        like  = f'%{q}%'
         query = query.filter(
             db.or_(Book.title.ilike(like), Book.author.ilike(like), Book.isbn.ilike(like))
         )
@@ -235,14 +292,18 @@ def add_book():
             return jsonify({'error': 'A book with this ISBN already exists', 'existing': existing.to_dict()}), 409
 
     book = Book(
-        isbn=data.get('isbn'),
-        title=data.get('title'),
-        author=data.get('author'),
-        description=data.get('description'),
-        publisher=data.get('publisher'),
-        publish_date=data.get('publish_date'),
-        cover_url=data.get('cover_url'),
+        isbn=data.get('isbn'), title=data.get('title'), author=data.get('author'),
+        description=data.get('description'), publisher=data.get('publisher'),
+        publish_date=data.get('publish_date'), cover_url=data.get('cover_url'),
     )
+
+    # Add to shelf if one was provided
+    shelf_id = data.get('shelf_id')
+    if shelf_id:
+        shelf = Shelf.query.get(shelf_id)
+        if shelf:
+            book.shelves.append(shelf)
+
     db.session.add(book)
     db.session.commit()
     return jsonify(book.to_dict()), 201
@@ -258,12 +319,14 @@ def delete_book(book_id):
 
 @app.route('/api/books/export', methods=['GET'])
 def export_csv():
-    books = Book.query.order_by(Book.added_at.desc()).all()
+    books  = Book.query.order_by(Book.added_at.desc()).all()
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(['ID', 'ISBN', 'Title', 'Author', 'Publisher', 'Publish Date', 'Description', 'Added At'])
+    writer.writerow(['ID', 'ISBN', 'Title', 'Author', 'Publisher', 'Publish Date', 'Description', 'Shelves', 'Added At'])
     for b in books:
-        writer.writerow([b.id, b.isbn, b.title, b.author, b.publisher, b.publish_date, b.description, b.added_at])
+        writer.writerow([b.id, b.isbn, b.title, b.author, b.publisher,
+                         b.publish_date, b.description,
+                         ', '.join(s.name for s in b.shelves), b.added_at])
     output.seek(0)
     return send_file(
         io.BytesIO(output.read().encode()),
