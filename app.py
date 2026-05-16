@@ -9,8 +9,6 @@ from datetime import datetime
 app = Flask(__name__)
 
 # --- Database Config ---
-# Set your PostgreSQL connection string in the environment variable DATABASE_URL
-# e.g. postgresql://user:password@localhost:5432/bookshelf
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get(
     'DATABASE_URL', 'postgresql://postgres:postgres@localhost:5432/bookshelf'
 )
@@ -47,6 +45,20 @@ class Book(db.Model):
 
 
 # --- Open Library Helpers ---
+
+def fetch_description(work_key):
+    """Fetch description text from the Works endpoint e.g. /works/OL123W"""
+    try:
+        resp = requests.get(f'https://openlibrary.org{work_key}.json', timeout=10)
+        data = resp.json()
+        desc = data.get('description', '')
+        if isinstance(desc, dict):
+            desc = desc.get('value', '')
+        return desc or ''
+    except Exception:
+        return ''
+
+
 def fetch_by_isbn(isbn):
     isbn = isbn.replace('-', '').replace(' ', '')
     url = f'https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&format=json&jscmd=data'
@@ -56,15 +68,24 @@ def fetch_by_isbn(isbn):
     if key not in data:
         return None
     book = data[key]
+
     cover = None
     if 'cover' in book:
         cover = book['cover'].get('large') or book['cover'].get('medium') or book['cover'].get('small')
+
     authors = ', '.join(a['name'] for a in book.get('authors', []))
     publishers = ', '.join(p['name'] for p in book.get('publishers', []))
     publish_date = book.get('publish_date', '')
+
+    # Try excerpts first, then fall back to the Works description
     description = ''
-    if 'excerpts' in book and book['excerpts']:
+    if book.get('excerpts'):
         description = book['excerpts'][0].get('text', '')
+    if not description:
+        work_key = (book.get('works') or [{}])[0].get('key', '')
+        if work_key:
+            description = fetch_description(work_key)
+
     return {
         'isbn':         isbn,
         'title':        book.get('title', ''),
@@ -76,23 +97,81 @@ def fetch_by_isbn(isbn):
     }
 
 
+def fetch_edition_details(ol_edition_key, partial):
+    """
+    Fetch full edition data from /books/OL123M.json and enrich the partial
+    result with ISBN, publisher, publish date, and description.
+    """
+    try:
+        resp = requests.get(f'https://openlibrary.org{ol_edition_key}.json', timeout=10)
+        edition = resp.json()
+
+        # ISBN - prefer ISBN-13
+        isbn = partial.get('isbn') or ''
+        if not isbn:
+            isbns = edition.get('isbn_13') or edition.get('isbn_10') or []
+            isbn = isbns[0] if isbns else ''
+
+        # Publisher
+        publisher = partial.get('publisher') or ', '.join(edition.get('publishers', []))
+
+        # Publish date
+        publish_date = partial.get('publish_date') or edition.get('publish_date', '')
+
+        # Description - try edition body first, then fall back to Works
+        ed_desc = edition.get('description', '')
+        if isinstance(ed_desc, dict):
+            ed_desc = ed_desc.get('value', '')
+        description = ed_desc or ''
+
+        if not description:
+            work_key = (edition.get('works') or [{}])[0].get('key', '')
+            if work_key:
+                description = fetch_description(work_key)
+
+        partial.update({
+            'isbn':         isbn,
+            'publisher':    publisher,
+            'publish_date': publish_date,
+            'description':  description,
+        })
+    except Exception:
+        pass
+    return partial
+
+
 def fetch_by_title(title):
-    url = f'https://openlibrary.org/search.json?title={requests.utils.quote(title)}&limit=5'
+    url = (
+        f'https://openlibrary.org/search.json'
+        f'?title={requests.utils.quote(title)}'
+        f'&limit=5'
+        f'&fields=key,title,author_name,isbn,publisher,first_publish_year,cover_i,edition_key'
+    )
     resp = requests.get(url, timeout=10)
     data = resp.json()
     results = []
     for doc in data.get('docs', []):
         cover_id = doc.get('cover_i')
         cover_url = f'https://covers.openlibrary.org/b/id/{cover_id}-L.jpg' if cover_id else None
-        results.append({
-            'isbn':         (doc.get('isbn') or [None])[0],
+        isbn = (doc.get('isbn') or [None])[0]
+        edition_keys = doc.get('edition_key') or []
+        ol_edition = f'/books/{edition_keys[0]}' if edition_keys else None
+
+        partial = {
+            'isbn':         isbn,
             'title':        doc.get('title', ''),
             'author':       ', '.join(doc.get('author_name', [])),
             'description':  '',
-            'publisher':    ', '.join(doc.get('publisher', [])[:2]),
+            'publisher':    ', '.join((doc.get('publisher') or [])[:2]),
             'publish_date': str(doc.get('first_publish_year', '')),
             'cover_url':    cover_url,
-        })
+        }
+
+        # Second call to fill in missing fields from the full edition record
+        if ol_edition:
+            partial = fetch_edition_details(ol_edition, partial)
+
+        results.append(partial)
     return results
 
 
@@ -143,7 +222,6 @@ def add_book():
     if not data or not data.get('title'):
         return jsonify({'error': 'Title is required'}), 400
 
-    # Check for duplicate ISBN
     if data.get('isbn'):
         existing = Book.query.filter_by(isbn=data['isbn']).first()
         if existing:
