@@ -17,6 +17,7 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
 
+
 # --- Model ---
 class Book(db.Model):
     __tablename__ = 'books'
@@ -42,6 +43,12 @@ class Book(db.Model):
             'cover_url':    self.cover_url,
             'added_at':     self.added_at.isoformat() if self.added_at else None,
         }
+
+
+@app.before_request
+def create_tables():
+    db.create_all()
+    app.before_request_funcs[None].remove(create_tables)
 
 
 # --- Open Library Helpers ---
@@ -270,7 +277,3 @@ if __name__ == '__main__':
     with app.app_context():
         db.create_all()
     app.run(debug=True, host='0.0.0.0', port=5000)
-
-# Runs under both Gunicorn and direct execution
-with app.app_context():
-    db.create_all()
